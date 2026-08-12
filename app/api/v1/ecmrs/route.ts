@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getPool } from "@/lib/db";
 import { canonicalJson, createEcmrReference, createVerificationId, sha256, type CanonicalValue } from "@/lib/trust";
 
 export const runtime = "nodejs";
@@ -84,6 +85,69 @@ export async function POST(request: NextRequest) {
   } as unknown as CanonicalValue;
   const eventHash = sha256(canonicalJson(eventPayload));
 
+  try {
+    const client = await getPool().connect();
+    try {
+      await client.query("BEGIN");
+
+      const ecmrResult = await client.query<{ id: string }>(
+        `
+          INSERT INTO ecmr (
+            reference,
+            verification_id,
+            external_reference,
+            status,
+            current_version
+          )
+          VALUES ($1, $2, $3, 'DRAFT', $4)
+          RETURNING id
+        `,
+        [ecmrId, verificationId, payload.externalReference ?? null, version]
+      );
+      const databaseId = ecmrResult.rows[0].id;
+
+      await client.query(
+        `
+          INSERT INTO ecmr_version (
+            ecmr_id,
+            version,
+            canonical_document,
+            document_hash
+          )
+          VALUES ($1, $2, $3::jsonb, $4)
+        `,
+        [databaseId, version, canonicalJson(canonicalDocument), documentHash]
+      );
+
+      await client.query(
+        `
+          INSERT INTO ecmr_event (
+            ecmr_id,
+            sequence_no,
+            event_type,
+            occurred_at,
+            document_version,
+            payload,
+            previous_event_hash,
+            event_hash
+          )
+          VALUES ($1, 1, 'ECMR_CREATED', $2, $3, $4::jsonb, NULL, $5)
+        `,
+        [databaseId, occurredAt, version, canonicalJson(eventPayload), eventHash]
+      );
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error("Unable to persist e-CMR", error);
+    return NextResponse.json({ error: "ECMR_PERSISTENCE_FAILED" }, { status: 503 });
+  }
+
   return NextResponse.json(
     {
       ecmrId,
@@ -98,6 +162,7 @@ export async function POST(request: NextRequest) {
         documentHash,
       },
       ledger: {
+        persisted: true,
         firstEvent: {
           type: "ECMR_CREATED",
           occurredAt,
